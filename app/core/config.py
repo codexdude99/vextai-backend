@@ -27,7 +27,10 @@ ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "https://vextai.netlify.app",
+            "https://*.netlify.app",
     ).split(",")
     if origin.strip()
 ]

@@ -12,7 +12,7 @@ if not GROQ_API_KEY:
     )
 
 # Model + behavior are overridable via environment variables.
-MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 

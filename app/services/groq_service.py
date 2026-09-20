@@ -182,13 +182,39 @@ or
         logger.warning("Memory extraction skipped: %s", e)
 
 
+def _fallback_title(message: str) -> str:
+    """Used whenever the model can't produce a usable title, so the sidebar
+    still shows something meaningful instead of a blank entry."""
+
+    words = message.strip().split()
+
+    if not words:
+        return "New Chat"
+
+    return " ".join(words[:6])[:50]
+
+
 async def generate_chat_title(first_message: str) -> str:
 
     try:
         completion = await client.chat.completions.create(
             model=MODEL_NAME,
             temperature=0.2,
-            max_tokens=20,
+            # gpt-oss "thinks" before answering, and that thinking eats into
+            # this budget too. Raising max_tokens alone (100, previously 20)
+            # wasn't enough — on a reasoning model the model can still spend
+            # the *entire* budget on its internal chain-of-thought before it
+            # ever writes the visible title, leaving `content` as "" with
+            # finish_reason "length". That was the actual cause of the
+            # sidebar showing a blank name: no exception was raised, so the
+            # "New Chat" fallback below never even ran — we saved the empty
+            # string as the real title. Capping reasoning effort keeps the
+            # thinking phase short enough that there's always budget left
+            # for the actual (five-word-max) answer.
+            max_tokens=200,
+            extra_body={
+                "reasoning_effort": "low",
+            },
             messages=[
                 {
                     "role": "system",
@@ -209,8 +235,22 @@ Rules:
             ]
         )
 
-        return completion.choices[0].message.content.strip()
+        raw = completion.choices[0].message.content or ""
+        title = raw.strip().strip("\"'")
+
+        if title:
+            return title
+
+        # No exception, but nothing usable came back (e.g. reasoning ate the
+        # whole token budget). Log it so this is visible if it starts
+        # happening often, then fall back to a title derived from the
+        # user's own message instead of a blank one.
+        logger.warning(
+            "Title generation returned empty content (finish_reason=%s)",
+            completion.choices[0].finish_reason,
+        )
 
     except Exception as e:
         logger.warning("Title generation failed, using fallback: %s", e)
-        return "New Chat"
+
+    return _fallback_title(first_message)

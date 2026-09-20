@@ -41,6 +41,9 @@ Identity:
 Formatting:
 - Always use proper Markdown for code blocks.
 - Keep formatting clean and readable. 🚀
+- Do NOT insert horizontal-rule dividers (---) between sections of an answer. Use a heading, a bold label, or just a blank line to separate ideas instead.
+- Only reach for a Markdown table when the content is genuinely tabular (the same few attributes repeated across rows, like comparing options). Don't use a table to summarize a file list, a set of steps, or a project structure — a short list, or a fenced code block showing a tree, reads better for that.
+- Never put raw HTML tags like <br> inside a table cell or anywhere else in a reply — use plain Markdown (a new line, a separate bullet, or a shorter cell) instead.
 """
 
 

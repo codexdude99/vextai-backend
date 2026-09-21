@@ -4,6 +4,7 @@ import os
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 if not GROQ_API_KEY:
     raise RuntimeError(
@@ -29,3 +30,10 @@ ALLOWED_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+
+# Web search (Tavily). AUTO_WEB_SEARCH_ENABLED is a kill switch: set it to
+# "false" to stop the model from ever calling the search tool on its own,
+# without touching code. It's a no-op either way if TAVILY_API_KEY isn't set
+# -- the model just answers from its own knowledge, no error.
+AUTO_WEB_SEARCH_ENABLED = os.getenv("AUTO_WEB_SEARCH_ENABLED", "true").lower() == "true"
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))

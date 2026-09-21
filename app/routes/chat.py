@@ -54,7 +54,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(extract_memory, request.chat_id, request.message)
 
     try:
-        answer = await ask_groq(request.chat_id, conversation)
+        answer = await ask_groq(request.chat_id, conversation, web_search=request.web_search)
     except GroqServiceError:
         raise HTTPException(
             status_code=502,
@@ -87,7 +87,7 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
         full_answer = ""
 
         try:
-            async for chunk in stream_groq(request.chat_id, conversation):
+            async for chunk in stream_groq(request.chat_id, conversation, web_search=request.web_search):
                 full_answer += chunk
                 yield chunk
 

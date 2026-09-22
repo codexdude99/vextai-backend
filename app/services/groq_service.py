@@ -7,6 +7,7 @@ from openai import AsyncOpenAI, APIError, APIConnectionError, APIStatusError
 from app.core.config import (
     GROQ_API_KEY,
     MODEL_NAME,
+    ROUTER_MODEL_NAME,
     TAVILY_API_KEY,
     AUTO_WEB_SEARCH_ENABLED,
     WEB_SEARCH_MAX_RESULTS,
@@ -87,6 +88,18 @@ WEB_SEARCH_TOOL = {
         },
     },
 }
+
+
+# Short, dedicated prompt for the routing decision only -- deliberately NOT
+# the full SYSTEM_PROMPT (personality, formatting rules, memory, etc). That
+# content is irrelevant to "does this need a search" and just adds tokens
+# for the router model to read through before it can answer, which costs
+# time on every single message.
+ROUTER_SYSTEM_PROMPT = """Decide whether accurately answering the user's latest message requires a live web search.
+
+Call search_web if the answer depends on something that can change over time or that might not match your training data anymore: news, current events, prices, sports scores, weather, schedules, software/product versions, who currently holds a role, or anything about "today", "now", "latest", "current", "this year".
+
+Do not call it for stable facts, definitions, math, code, or general knowledge that doesn't change. If no search is needed, don't call any tool and don't write a reply -- just stop."""
 
 
 class GroqServiceError(Exception):
@@ -216,30 +229,37 @@ async def _safe_search(query: str) -> str:
         )
 
 
-async def _decide_and_search(system_content: str, messages) -> str:
+async def _decide_and_search(messages) -> str:
     """One quick, non-streaming call whose only job is deciding whether this
-    message needs a live web search -- and running it if so. Deliberately
-    kept separate from the streamed answer (see WEB_SEARCH_TOOL comment)
-    and wrapped in a broad except: any failure here -- a bad tool-call
-    payload, a provider hiccup, an odd response shape -- just skips the
-    search silently rather than risking the real answer."""
+    message needs a live web search -- and running it if so. Runs on
+    ROUTER_MODEL_NAME (small, no reasoning phase), not the main answer
+    model, and only sees the last couple of turns, not the full history or
+    personality prompt -- both purely for speed, since this happens in
+    front of every reply. Deliberately kept separate from the streamed
+    answer (see WEB_SEARCH_TOOL comment) and wrapped in a broad except: any
+    failure here -- a bad tool-call payload, a provider hiccup, an odd
+    response shape -- just skips the search silently rather than risking
+    the real answer."""
 
     if not (AUTO_WEB_SEARCH_ENABLED and TAVILY_API_KEY):
         return ""
 
     try:
+        router_messages = [
+            {
+                "role": "system",
+                "content": ROUTER_SYSTEM_PROMPT + "\n\n" + _current_date_context(),
+            },
+            *messages[-4:],
+        ]
+
         completion = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "system", "content": system_content}, *messages],
+            model=ROUTER_MODEL_NAME,
+            messages=router_messages,
             tools=[WEB_SEARCH_TOOL],
             tool_choice="auto",
-            # This step only ever needs to produce a short tool call (or
-            # nothing) -- never a full answer -- so keep it cheap and fast.
-            # reasoning_effort low + a real token budget avoids the same
-            # "reasoning ate the whole budget, content came back empty"
-            # failure mode already seen (and fixed) in generate_chat_title.
-            max_tokens=300,
-            extra_body={"reasoning_effort": "low"},
+            max_tokens=150,
+            temperature=0,
         )
         choice = completion.choices[0]
 
@@ -263,8 +283,8 @@ async def ask_groq(chat_id: str, messages, web_search: bool = False):
             # Manual override: always search using the user's own message.
             web_context = await _safe_search(messages[-1]["content"])
         else:
-            # Automatic mode (default): let the model decide first.
-            web_context = await _decide_and_search(system_content, messages)
+            # Automatic mode (default): let the router model decide first.
+            web_context = await _decide_and_search(messages)
 
         chat_messages = [
             {"role": "system", "content": _with_web_context(system_content, web_context)},
@@ -288,7 +308,7 @@ async def stream_groq(chat_id: str, messages, web_search: bool = False):
     if web_search:
         web_context = await _safe_search(messages[-1]["content"])
     else:
-        web_context = await _decide_and_search(system_content, messages)
+        web_context = await _decide_and_search(messages)
 
     chat_messages = [
         {"role": "system", "content": _with_web_context(system_content, web_context)},

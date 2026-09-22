@@ -10,6 +10,9 @@ class ChatRequest(BaseModel):
     # appending it a second time (see routes/chat.py).
     regenerate: bool = False
 
+    # True when the user enables the web-search/globe button.
+    web_search: bool = False
+
 
 class TitleRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)

@@ -46,10 +46,7 @@ Identity:
 - NEVER introduce yourself unless the user asks.
 
 Web search:
-- You have a `search_web` tool that fetches live results from the internet. It costs a couple of extra seconds, so use it with judgment.
-- Call it automatically, without asking the user for permission first, whenever the answer depends on something that can change over time or that you can't be fully confident is still accurate as of today: news, current events, prices, scores, weather, schedules, software/product versions, who currently holds a role or title, or anything about "today," "now," "latest," "current," "this year," etc.
-- Do NOT call it for stable facts, definitions, math, code, or general knowledge that doesn't change — answer those directly.
-- When you do search, base your answer on the returned results, prefer the most recent and relevant ones, and cite them inline as Markdown links using the URLs provided. Never claim you searched the web if you did not, and never invent a source URL.
+- Sometimes live web search results will already be included below, under "LIVE WEB SEARCH RESULTS". When they are, base your answer on them, prefer the most recent and relevant ones, and cite them inline as Markdown links using the URLs provided. Never claim you searched the web if no results were provided, and never invent a source URL.
 
 Formatting:
 - Always use proper Markdown for code blocks.
@@ -59,9 +56,13 @@ Formatting:
 - Never put raw HTML tags like <br> inside a table cell or anywhere else in a reply — use plain Markdown (a new line, a separate bullet, or a shorter cell) instead.
 """
 
-# Tool schema handed to the model so it can decide, on its own, when a
-# question needs live web results. gpt-oss-120b supports tool calling but
-# not *parallel* tool calls, so it will request this one tool at a time.
+# Tool schema used ONLY for the one-shot, non-streaming "does this need a
+# search" decision below -- never combined with stream=True. Groq's
+# gpt-oss-120b has open bugs where streaming + tool calls together can
+# return malformed chunks or a 400 on the follow-up turn (the model's
+# reasoning trace gets attached to the message and Groq rejects it if you
+# send it back). Keeping tool use strictly non-streaming, and never
+# replaying the raw tool-call message back to Groq, sidesteps both.
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -86,11 +87,6 @@ WEB_SEARCH_TOOL = {
         },
     },
 }
-
-# Safety cap on how many times we let the model call search_web in a single
-# reply before forcing a final answer. Keeps a confused/looping model from
-# turning one chat message into a chain of slow tool calls.
-MAX_TOOL_ROUNDS = 2
 
 
 class GroqServiceError(Exception):
@@ -130,26 +126,16 @@ def _with_web_context(system_content: str, web_context: str) -> str:
     )
 
 
-def _extract_query_from_args(arguments: str, fallback: str) -> str:
-    """Pulls the `query` argument out of a tool call's (possibly malformed)
-    JSON arguments string. Falls back to the user's own message if parsing
-    fails -- a tool call should never be allowed to hard-crash a reply."""
+def _extract_query(tool_call, fallback: str) -> str:
+    """Pulls the `query` argument out of a tool call. Falls back to the
+    user's own message if the model produced malformed/truncated JSON --
+    a bad tool call should never be allowed to hard-crash a reply."""
 
     try:
-        args = json.loads(arguments or "{}")
+        args = json.loads(tool_call.function.arguments or "{}")
         query = (args.get("query") or "").strip()
         return query or fallback
     except (json.JSONDecodeError, AttributeError):
-        return fallback
-
-
-def _extract_query(tool_call, fallback: str) -> str:
-    """Same as above, but for a tool_call object as returned by the SDK
-    (non-streaming path) rather than a raw arguments string."""
-
-    try:
-        return _extract_query_from_args(tool_call.function.arguments, fallback)
-    except AttributeError:
         return fallback
 
 
@@ -217,8 +203,7 @@ async def search_web(query: str) -> str:
 
 async def _safe_search(query: str) -> str:
     """Wraps search_web so a Tavily hiccup (missing key, timeout, rate limit)
-    degrades the reply instead of crashing it -- same philosophy as the rest
-    of this file: a broken dependency should never 500 the whole chat."""
+    degrades the reply instead of crashing it."""
 
     try:
         return await search_web(query)
@@ -231,60 +216,61 @@ async def _safe_search(query: str) -> str:
         )
 
 
+async def _decide_and_search(system_content: str, messages) -> str:
+    """One quick, non-streaming call whose only job is deciding whether this
+    message needs a live web search -- and running it if so. Deliberately
+    kept separate from the streamed answer (see WEB_SEARCH_TOOL comment)
+    and wrapped in a broad except: any failure here -- a bad tool-call
+    payload, a provider hiccup, an odd response shape -- just skips the
+    search silently rather than risking the real answer."""
+
+    if not (AUTO_WEB_SEARCH_ENABLED and TAVILY_API_KEY):
+        return ""
+
+    try:
+        completion = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "system", "content": system_content}, *messages],
+            tools=[WEB_SEARCH_TOOL],
+            tool_choice="auto",
+            # This step only ever needs to produce a short tool call (or
+            # nothing) -- never a full answer -- so keep it cheap and fast.
+            # reasoning_effort low + a real token budget avoids the same
+            # "reasoning ate the whole budget, content came back empty"
+            # failure mode already seen (and fixed) in generate_chat_title.
+            max_tokens=300,
+            extra_body={"reasoning_effort": "low"},
+        )
+        choice = completion.choices[0]
+
+        if not choice.message.tool_calls:
+            return ""
+
+        tool_call = choice.message.tool_calls[0]
+        query = _extract_query(tool_call, messages[-1]["content"])
+        return await _safe_search(query)
+
+    except Exception as e:
+        logger.warning("Auto web-search decision failed, answering without it: %s", e)
+        return ""
+
+
 async def ask_groq(chat_id: str, messages, web_search: bool = False):
     try:
         system_content = _build_system_content(chat_id)
 
-        # Manual override (e.g. a "search the web" toggle in the UI): always
-        # search once up front using the user's own message as the query,
-        # then answer with that context. Skips letting the model decide.
         if web_search:
+            # Manual override: always search using the user's own message.
             web_context = await _safe_search(messages[-1]["content"])
-            chat_messages = [
-                {"role": "system", "content": _with_web_context(system_content, web_context)},
-                *messages,
-            ]
-            completion = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=chat_messages,
-            )
-            return completion.choices[0].message.content
+        else:
+            # Automatic mode (default): let the model decide first.
+            web_context = await _decide_and_search(system_content, messages)
 
-        # Automatic mode (default): offer the model the search_web tool and
-        # let it decide, on its own, whether this particular question needs
-        # live results. If Tavily isn't configured, the tool simply isn't
-        # offered -- the model just answers normally, no error.
-        chat_messages = [{"role": "system", "content": system_content}, *messages]
-        tools_enabled = AUTO_WEB_SEARCH_ENABLED and bool(TAVILY_API_KEY)
+        chat_messages = [
+            {"role": "system", "content": _with_web_context(system_content, web_context)},
+            *messages,
+        ]
 
-        for _ in range(MAX_TOOL_ROUNDS):
-            completion = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=chat_messages,
-                tools=[WEB_SEARCH_TOOL] if tools_enabled else None,
-                tool_choice="auto" if tools_enabled else None,
-            )
-            choice = completion.choices[0]
-
-            if not choice.message.tool_calls:
-                return choice.message.content
-
-            # Record the assistant's tool-call turn, then feed each tool
-            # result back in as its own "tool" message, per the standard
-            # OpenAI/Groq function-calling flow.
-            chat_messages.append(choice.message)
-
-            for tool_call in choice.message.tool_calls:
-                query = _extract_query(tool_call, messages[-1]["content"])
-                web_context = await _safe_search(query)
-                chat_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": web_context,
-                })
-
-        # Used up MAX_TOOL_ROUNDS and the model still wants to call tools --
-        # ask one last time without offering the tool so it's forced to answer.
         completion = await client.chat.completions.create(
             model=MODEL_NAME,
             messages=chat_messages,
@@ -299,138 +285,38 @@ async def ask_groq(chat_id: str, messages, web_search: bool = False):
 async def stream_groq(chat_id: str, messages, web_search: bool = False):
     system_content = _build_system_content(chat_id)
 
-    # Manual override: same idea as ask_groq -- search once up front, then
-    # stream a single normal completion with that context baked in.
     if web_search:
         web_context = await _safe_search(messages[-1]["content"])
-        chat_messages = [
-            {"role": "system", "content": _with_web_context(system_content, web_context)},
-            *messages,
-        ]
+    else:
+        web_context = await _decide_and_search(system_content, messages)
 
-        try:
-            stream = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=chat_messages,
-                stream=True,
-            )
-        except (APIConnectionError, APIStatusError, APIError) as e:
-            logger.error("Groq API error starting stream: %s", e)
-            raise GroqServiceError(str(e)) from e
+    chat_messages = [
+        {"role": "system", "content": _with_web_context(system_content, web_context)},
+        *messages,
+    ]
 
-        try:
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
-        except (APIConnectionError, APIStatusError, APIError) as e:
-            logger.error("Groq API error mid-stream: %s", e)
-            yield "\n\n⚠ Lost connection to the AI service. Please try again."
+    # Plain streaming completion, no `tools` involved -- identical to the
+    # code path that already worked before web search existed.
+    try:
+        stream = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=chat_messages,
+            stream=True,
+        )
+    except (APIConnectionError, APIStatusError, APIError) as e:
+        logger.error("Groq API error starting stream: %s", e)
+        raise GroqServiceError(str(e)) from e
 
-        return
-
-    # Automatic mode: stream normally, but watch for the model asking to
-    # call search_web. Tool-call requests arrive as fragments across many
-    # chunks (id, then the function name, then the arguments piece by piece)
-    # instead of as visible text, so we accumulate them separately from
-    # regular content and only act once the model finishes requesting them.
-    chat_messages = [{"role": "system", "content": system_content}, *messages]
-    tools_enabled = AUTO_WEB_SEARCH_ENABLED and bool(TAVILY_API_KEY)
-
-    for round_num in range(MAX_TOOL_ROUNDS + 1):
-        offer_tools = tools_enabled and round_num < MAX_TOOL_ROUNDS
-
-        try:
-            stream = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=chat_messages,
-                tools=[WEB_SEARCH_TOOL] if offer_tools else None,
-                tool_choice="auto" if offer_tools else None,
-                stream=True,
-            )
-        except (APIConnectionError, APIStatusError, APIError) as e:
-            logger.error("Groq API error starting stream: %s", e)
-            raise GroqServiceError(str(e)) from e
-
-        tool_calls_acc = {}
-        assistant_content = ""
-
-        try:
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-
-                delta = chunk.choices[0].delta
-
-                if delta.content:
-                    assistant_content += delta.content
-                    yield delta.content
-
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        slot = tool_calls_acc.setdefault(
-                            tc.index, {"id": None, "name": None, "arguments": ""}
-                        )
-                        if tc.id:
-                            slot["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            slot["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            slot["arguments"] += tc.function.arguments
-
-        except (APIConnectionError, APIStatusError, APIError) as e:
-            logger.error("Groq API error mid-stream: %s", e)
-            yield "\n\n⚠ Lost connection to the AI service. Please try again."
-            return
-
-        if not tool_calls_acc:
-            # Normal reply, no search needed -- done.
-            return
-
-        # The model asked to search. Replay its tool-call turn into the
-        # running message list, run each search, feed the results back as
-        # tool messages, then loop to start a fresh stream that continues
-        # with that context in hand.
-        tool_calls_list = [
-            {
-                "id": slot["id"],
-                "type": "function",
-                "function": {
-                    "name": slot["name"],
-                    "arguments": slot["arguments"],
-                },
-            }
-            for slot in tool_calls_acc.values()
-            if slot["id"] and slot["name"]
-        ]
-
-        if not tool_calls_list:
-            # Malformed/empty tool call fragments -- nothing usable to run,
-            # so just stop here rather than looping forever.
-            return
-
-        chat_messages.append({
-            "role": "assistant",
-            "content": assistant_content or None,
-            "tool_calls": tool_calls_list,
-        })
-
-        for slot in tool_calls_acc.values():
-            if not slot["id"]:
+    try:
+        async for chunk in stream:
+            if not chunk.choices:
                 continue
-            query = _extract_query_from_args(slot["arguments"], messages[-1]["content"])
-            web_context = await _safe_search(query)
-            chat_messages.append({
-                "role": "tool",
-                "tool_call_id": slot["id"],
-                "content": web_context,
-            })
-
-    # Fallback safety net: if we somehow exit the loop without returning
-    # (shouldn't happen given the round cap above forces tools off on the
-    # last pass), there's nothing more to yield.
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+    except (APIConnectionError, APIStatusError, APIError) as e:
+        logger.error("Groq API error mid-stream: %s", e)
+        yield "\n\n⚠ Lost connection to the AI service. Please try again."
 
 
 async def extract_memory(chat_id: str, user_message: str):
@@ -572,10 +458,6 @@ Rules:
         if title:
             return title
 
-        # No exception, but nothing usable came back (e.g. reasoning ate the
-        # whole token budget). Log it so this is visible if it starts
-        # happening often, then fall back to a title derived from the
-        # user's own message instead of a blank one.
         logger.warning(
             "Title generation returned empty content (finish_reason=%s)",
             completion.choices[0].finish_reason,

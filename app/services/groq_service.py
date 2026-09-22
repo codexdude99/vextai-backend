@@ -253,14 +253,22 @@ async def _decide_and_search(messages) -> str:
             *messages[-4:],
         ]
 
-        completion = await client.chat.completions.create(
-            model=ROUTER_MODEL_NAME,
-            messages=router_messages,
-            tools=[WEB_SEARCH_TOOL],
-            tool_choice="auto",
-            max_tokens=150,
-            temperature=0,
-        )
+                completion = await client.chat.completions.create(
+                    model=ROUTER_MODEL_NAME,
+                    messages=router_messages,
+                    tools=[WEB_SEARCH_TOOL],
+                    tool_choice="auto",
+                    # gpt-oss-20b is a reasoning model -- it "thinks" before
+                    # answering, and that thinking eats into max_tokens too. Too low
+                    # a budget risks the exact failure already seen (and fixed) in
+                    # generate_chat_title: reasoning eats the whole budget, content
+                    # comes back empty, with no exception raised. reasoning_effort
+                    # "low" plus a real budget keeps this step quick without hitting
+                    # that trap.
+                    max_tokens=250,
+                    temperature=0,
+                    extra_body={"reasoning_effort": "low"},
+                )
         choice = completion.choices[0]
 
         if not choice.message.tool_calls:

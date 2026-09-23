@@ -19,9 +19,20 @@ logger = logging.getLogger("vextai.groq")
 # Async client: previously this was a sync client called directly inside
 # `async def` routes, which blocks FastAPI's whole event loop for the
 # duration of every Groq call (nobody else could be served meanwhile).
+#
+# timeout: the SDK's default is 600s with no timeout set explicitly. Groq is
+# normally very fast, so a stalled request almost always means something is
+# actually wrong upstream -- 30s is generous headroom for a real reply while
+# still failing (and returning the "couldn't reach the model" error) long
+# before a user would call the app "slow" and give up. Since this is a
+# per-read timeout (not a hard cap on total response time), a long but
+# actively-streaming answer is unaffected -- it only trips when no new data
+# arrives for 30s straight.
 client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1",
+    timeout=30.0,
+    max_retries=2,
 )
 
 SYSTEM_PROMPT = """
@@ -116,10 +127,10 @@ def _current_date_context() -> str:
     return f"Today's date is {now.strftime('%A, %B %d, %Y')} (UTC)."
 
 
-def _build_system_content(chat_id: str) -> str:
+async def _build_system_content(chat_id: str) -> str:
     parts = [SYSTEM_PROMPT.strip(), _current_date_context()]
 
-    memory_text = format_memory(chat_id)
+    memory_text = await format_memory(chat_id)
     if memory_text:
         parts.append(memory_text)
 
@@ -253,22 +264,18 @@ async def _decide_and_search(messages) -> str:
             *messages[-4:],
         ]
 
-                completion = await client.chat.completions.create(
-                    model=ROUTER_MODEL_NAME,
-                    messages=router_messages,
-                    tools=[WEB_SEARCH_TOOL],
-                    tool_choice="auto",
-                    # gpt-oss-20b is a reasoning model -- it "thinks" before
-                    # answering, and that thinking eats into max_tokens too. Too low
-                    # a budget risks the exact failure already seen (and fixed) in
-                    # generate_chat_title: reasoning eats the whole budget, content
-                    # comes back empty, with no exception raised. reasoning_effort
-                    # "low" plus a real budget keeps this step quick without hitting
-                    # that trap.
-                    max_tokens=250,
-                    temperature=0,
-                    extra_body={"reasoning_effort": "low"},
-                )
+        # ROUTER_MODEL_NAME (llama-3.1-8b-instant) has no reasoning/thinking
+        # phase, so unlike generate_chat_title there's no need for
+        # reasoning_effort or a large max_tokens safety margin here -- the
+        # model goes straight to either a tool call or a short answer.
+        completion = await client.chat.completions.create(
+            model=ROUTER_MODEL_NAME,
+            messages=router_messages,
+            tools=[WEB_SEARCH_TOOL],
+            tool_choice="auto",
+            max_tokens=250,
+            temperature=0,
+        )
         choice = completion.choices[0]
 
         if not choice.message.tool_calls:
@@ -285,7 +292,7 @@ async def _decide_and_search(messages) -> str:
 
 async def ask_groq(chat_id: str, messages, web_search: bool = False):
     try:
-        system_content = _build_system_content(chat_id)
+        system_content = await _build_system_content(chat_id)
 
         if web_search:
             # Manual override: always search using the user's own message.
@@ -311,7 +318,7 @@ async def ask_groq(chat_id: str, messages, web_search: bool = False):
 
 
 async def stream_groq(chat_id: str, messages, web_search: bool = False):
-    system_content = _build_system_content(chat_id)
+    system_content = await _build_system_content(chat_id)
 
     if web_search:
         web_context = await _safe_search(messages[-1]["content"])
@@ -357,8 +364,15 @@ async def extract_memory(chat_id: str, user_message: str):
     """
 
     try:
+        # This is a trivial yes/no + key/value extraction task, not
+        # something that needs MODEL_NAME's full reasoning model. Using the
+        # same heavy model here meant every single message fired two calls
+        # to it at once (this one plus the real reply), competing for the
+        # same rate limit / capacity. ROUTER_MODEL_NAME (fast, no thinking
+        # phase, supports JSON mode) does this job just as well and frees
+        # MODEL_NAME up to focus on the reply the user is actually waiting on.
         completion = await client.chat.completions.create(
-            model=MODEL_NAME,
+            model=ROUTER_MODEL_NAME,
             temperature=0,
             response_format={"type": "json_object"},
             messages=[
@@ -419,7 +433,7 @@ or
         result = json.loads(completion.choices[0].message.content)
 
         if result.get("remember") and result.get("key") and result.get("value"):
-            add_memory(chat_id, result["key"], result["value"])
+            await add_memory(chat_id, result["key"], result["value"])
 
     except Exception as e:
         # Memory extraction is a best-effort enhancement, not core to the

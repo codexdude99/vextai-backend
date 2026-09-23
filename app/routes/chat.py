@@ -106,6 +106,16 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
     return StreamingResponse(
         generate(),
         media_type="text/plain",
+        headers={
+            # Without these, some reverse proxies / PaaS layers (nginx's
+            # default proxy_buffering, for example) buffer the entire
+            # streamed reply before sending anything to the browser. The
+            # backend is streaming token-by-token the whole time -- it just
+            # never reaches the client that way, so the reply looks like one
+            # long pause followed by the whole answer appearing at once.
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
     )
 
 
@@ -125,7 +135,7 @@ async def delete_chat(chat_id: str):
     when a chat is deleted in the sidebar so nothing lingers forever."""
 
     clear_chat(chat_id)
-    clear_memory(chat_id)
+    await clear_memory(chat_id)
 
     return {
         "deleted": True

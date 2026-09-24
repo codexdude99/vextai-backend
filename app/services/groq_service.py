@@ -156,7 +156,17 @@ def _with_web_context(
 # complete Groq API request from every normal message.
 # ============================================================
 
-def _needs_web_search(message: str) -> bool:
+async def _needs_web_search(message: str) -> bool:
+    """
+    Decide whether a user message needs current/external web information.
+
+    The decision uses:
+    1. Fast local rules for obvious cases.
+    2. GPT-OSS 20B for ambiguous intent detection.
+
+    This function NEVER answers the user's question.
+    It only returns True or False.
+    """
 
     if not AUTO_WEB_SEARCH_ENABLED:
         return False
@@ -167,126 +177,191 @@ def _needs_web_search(message: str) -> bool:
     if not message:
         return False
 
-    text = message.lower().strip()
+    text = " ".join(message.lower().strip().split())
 
-    # Never search simple math/calculation questions.
-    # Examples:
-    # "How much is 1+1?"
-    # "What is 25 * 48?"
-    # "100 divided by 4"
-    math_words = (
-        "calculate",
-        "calculation",
-        "solve",
-        "what is",
-        "how much is",
-        "equals",
+    # ---------------------------------------------------------
+    # 1. Obvious math/calculation questions -> NEVER SEARCH
+    # ---------------------------------------------------------
+
+    math_patterns = (
+        r"^\s*(what is|whats|calculate|solve)\s+[\d\s\+\-\*\/\%\(\)\.\^=]+[\?]?\s*$",
+        r"^\s*[\d\s\+\-\*\/\%\(\)\.\^=]+\s*$",
+        r"^\s*how much is\s+[\d\s\+\-\*\/\%\(\)\.\^=]+[\?]?\s*$",
+        r"^\s*what does\s+[\d\s\+\-\*\/\%\(\)\.\^=]+\s+equal\s*\??\s*$",
     )
 
-    math_symbols = (
-        "+",
-        "-",
-        "*",
-        "/",
-        "%",
-        "=",
+    import re
+
+    if any(re.fullmatch(pattern, text) for pattern in math_patterns):
+        return False
+
+    # ---------------------------------------------------------
+    # 2. Obvious non-web questions -> NEVER SEARCH
+    # ---------------------------------------------------------
+
+    obvious_local_patterns = (
+        "what is a variable",
+        "what is a function",
+        "what is a list",
+        "what is a dictionary",
+        "what is a loop",
+        "what is recursion",
+        "what is an array",
+        "what is an integer",
+        "what is a string",
+        "explain python",
+        "explain javascript",
+        "explain java",
+        "explain html",
+        "explain css",
+        "how does python work",
+        "how does javascript work",
+        "how does java work",
+        "write a python",
+        "write python code",
+        "write javascript",
+        "write java code",
+        "help me debug",
+        "debug this code",
     )
 
-    if any(symbol in text for symbol in math_symbols):
-        # If the message contains math symbols and doesn't contain
-        # an obvious current-information word, don't search.
-        current_words = (
-            "latest",
-            "current",
-            "today",
-            "now",
-            "recent",
-            "news",
-            "update",
-            "updates",
-            "release",
-            "released",
-            "version",
-            "price",
-            "prices",
-            "weather",
-            "schedule",
-            "score",
-            "scores",
-        )
+    if any(pattern in text for pattern in obvious_local_patterns):
+        return False
 
-        if not any(word in text for word in current_words):
-            return False
+    # ---------------------------------------------------------
+    # 3. Obvious current-information questions -> SEARCH
+    # ---------------------------------------------------------
 
-    # Search only for clearly time-sensitive requests.
-    search_phrases = (
-        "latest",
-        "current",
-        "currently",
+    obvious_web_patterns = (
         "today",
+        "yesterday",
+        "tomorrow",
         "tonight",
         "right now",
-        "recent",
-        "recently",
+        "currently",
+        "at the moment",
         "this week",
         "this month",
         "this year",
-
-        "news",
+        "recently",
+        "recent",
+        "latest",
+        "newest",
+        "just released",
+        "just announced",
         "breaking news",
-        "latest news",
-
-        "update",
-        "updates",
+        "news today",
+        "what happened",
+        "what happened today",
+        "who won",
+        "who is winning",
+        "current price",
+        "current version",
+        "current update",
         "latest update",
-        "new update",
-        "newly added",
-        "just added",
-
-        "release",
-        "released",
-        "release date",
         "latest version",
-        "new version",
         "patch notes",
-
-        "game update",
-        "game updates",
-        "roblox update",
-        "minecraft update",
-        "bgmi update",
-        "fortnite update",
-
-        "price",
-        "prices",
-        "cost",
-
+        "release date",
+        "released",
         "available now",
-        "is it available",
-
-        "live score",
-        "scores",
-        "standings",
-        "schedule",
-
+        "stock price",
+        "bitcoin price",
+        "crypto price",
         "weather",
         "temperature",
         "forecast",
-
-        "who is the current",
-        "who currently",
-        "current president",
-        "current prime minister",
-        "current ceo",
-
-        "2026",
-        "2027",
+        "live score",
+        "live scores",
+        "standings",
+        "schedule",
     )
 
-    return any(
-        phrase in text
-        for phrase in search_phrases
-    )
+    if any(pattern in text for pattern in obvious_web_patterns):
+        return True
+
+    # ---------------------------------------------------------
+    # 4. Ambiguous case -> tiny intent classifier
+    # ---------------------------------------------------------
+
+    try:
+        completion = await client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are VextAI's web-search intent classifier.\n\n"
+                        "Your ONLY job is to decide whether the user's "
+                        "question requires searching the internet.\n\n"
+
+                        "Return JSON ONLY:\n"
+                        '{"search":true}\n'
+                        "or\n"
+                        '{"search":false}\n\n'
+
+                        "Return search=true when the answer depends on "
+                        "current, recent, changing, live, external, "
+                        "real-world, or specific online information.\n\n"
+
+                        "Examples that REQUIRE search:\n"
+                        "- Who won the Minecraft Championship yesterday?\n"
+                        "- What happened in Roblox today?\n"
+                        "- Is GTA 6 delayed?\n"
+                        "- What is Bitcoin worth right now?\n"
+                        "- What games came out this week?\n"
+                        "- What is the latest iPhone price?\n"
+                        "- Did Minecraft add a new mob?\n"
+                        "- What are today's gaming news?\n\n"
+
+                        "Examples that DO NOT require search:\n"
+                        "- What is 1+1?\n"
+                        "- Explain Python lists.\n"
+                        "- What is recursion?\n"
+                        "- How do I make a Python loop?\n"
+                        "- Write a Java function.\n"
+                        "- Explain photosynthesis.\n"
+                        "- Why is the sky blue?\n\n"
+
+                        "Important:\n"
+                        "- Do not answer the question.\n"
+                        "- Do not explain your decision.\n"
+                        "- Do not use markdown.\n"
+                        "- Return JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": message[:2000],
+                },
+            ],
+            temperature=0,
+            max_tokens=20,
+            reasoning_effort="low",
+            include_reasoning=False,
+            response_format={"type": "json_object"},
+        )
+
+        raw = (
+            completion.choices[0]
+            .message
+            .content
+            or "{}"
+        )
+
+        result = json.loads(raw)
+
+        return bool(result.get("search", False))
+
+    except Exception as e:
+        logger.warning(
+            "Web intent classifier failed: %s",
+            e,
+        )
+
+        # IMPORTANT:
+        # If the classifier fails, do NOT randomly search.
+        # Normal AI operation continues without web search.
+        return False
 
 
 # ============================================================
@@ -475,7 +550,7 @@ async def ask_groq(
         # time-sensitive.
         should_search = (
             web_search
-            or _needs_web_search(last_message)
+            or await _needs_web_search(last_message)
         )
 
         web_context = ""

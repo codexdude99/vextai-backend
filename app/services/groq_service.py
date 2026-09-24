@@ -169,27 +169,73 @@ def _needs_web_search(message: str) -> bool:
 
     text = message.lower().strip()
 
+    # Never search simple math/calculation questions.
+    # Examples:
+    # "How much is 1+1?"
+    # "What is 25 * 48?"
+    # "100 divided by 4"
+    math_words = (
+        "calculate",
+        "calculation",
+        "solve",
+        "what is",
+        "how much is",
+        "equals",
+    )
+
+    math_symbols = (
+        "+",
+        "-",
+        "*",
+        "/",
+        "%",
+        "=",
+    )
+
+    if any(symbol in text for symbol in math_symbols):
+        # If the message contains math symbols and doesn't contain
+        # an obvious current-information word, don't search.
+        current_words = (
+            "latest",
+            "current",
+            "today",
+            "now",
+            "recent",
+            "news",
+            "update",
+            "updates",
+            "release",
+            "released",
+            "version",
+            "price",
+            "prices",
+            "weather",
+            "schedule",
+            "score",
+            "scores",
+        )
+
+        if not any(word in text for word in current_words):
+            return False
+
+    # Search only for clearly time-sensitive requests.
     search_phrases = (
-        # Current information
         "latest",
         "current",
         "currently",
         "today",
         "tonight",
         "right now",
-        "now",
         "recent",
         "recently",
         "this week",
         "this month",
         "this year",
 
-        # News
         "news",
         "breaking news",
         "latest news",
 
-        # Updates
         "update",
         "updates",
         "latest update",
@@ -197,67 +243,50 @@ def _needs_web_search(message: str) -> bool:
         "newly added",
         "just added",
 
-        # Releases / versions
         "release",
         "released",
         "release date",
         "latest version",
         "new version",
-        "version",
         "patch notes",
-        "patch",
-        "season",
-        "new season",
 
-        # Games
         "game update",
         "game updates",
-        "latest game",
-        "new game",
         "roblox update",
         "minecraft update",
         "bgmi update",
         "fortnite update",
 
-        # Prices
         "price",
         "prices",
         "cost",
-        "how much does",
-        "how much is",
 
-        # Availability
         "available now",
         "is it available",
-        "is available",
-        "when is it available",
 
-        # Live information
-        "live",
         "live score",
-        "score",
         "scores",
         "standings",
         "schedule",
 
-        # Weather
         "weather",
         "temperature",
         "forecast",
 
-        # Public/current people
         "who is the current",
         "who currently",
         "current president",
         "current prime minister",
         "current ceo",
 
-        # Time-sensitive words
         "2026",
         "2027",
     )
 
-    return any(phrase in text for phrase in search_phrases)
+    return any(
+        phrase in text
+        for phrase in search_phrases
+    )
 
 
 # ============================================================

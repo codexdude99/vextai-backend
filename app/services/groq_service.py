@@ -837,30 +837,38 @@ async def generate_chat_title(
 ) -> str:
 
     try:
-
+        # Use the fast GPT-OSS 20B model for titles.
+        # A title does NOT need the large 120B reasoning model.
         completion = await client.chat.completions.create(
-            model=MODEL_NAME,
-            temperature=0.2,
-            max_tokens=200,
-            reasoning_effort="low",
+            model="openai/gpt-oss-20b",
             messages=[
                 {
                     "role": "system",
-                    "content": """
-Generate a very short chat title.
-
-Rules:
-- Maximum 5 words.
-- No quotation marks.
-- No punctuation at the end.
-- Return ONLY the title.
-""",
+                    "content": (
+                        "You generate chat titles only.\n"
+                        "DO NOT answer the user's question.\n"
+                        "DO NOT apologize.\n"
+                        "DO NOT say you cannot help.\n"
+                        "DO NOT explain anything.\n\n"
+                        "Create a short title describing the user's request.\n"
+                        "Maximum 6 words.\n"
+                        "Return ONLY the title.\n"
+                        "No quotes.\n"
+                        "No punctuation at the end."
+                        "Make perfect chat title like how chatgpt and claude does."
+                    ),
                 },
                 {
                     "role": "user",
-                    "content": first_message,
+                    "content": (
+                        "Create a title for this user's message:\n\n"
+                        + first_message[:1000]
+                    ),
                 },
             ],
+            temperature=0,
+            max_tokens=30,
+            reasoning_effort="low",
         )
 
         raw = (
@@ -870,26 +878,42 @@ Rules:
             or ""
         )
 
-        title = (
-            raw
-            .strip()
-            .strip("\"'")
+        title = raw.strip()
+
+        # Remove accidental quotes.
+        title = title.strip("\"'")
+
+        # Remove accidental newlines.
+        title = title.split("\n")[0].strip()
+
+        # Never allow an AI answer to become the chat title.
+        bad_starts = (
+            "i'm sorry",
+            "im sorry",
+            "sorry",
+            "i can't",
+            "i cannot",
+            "i’m sorry",
+            "i’m unable",
+            "as an ai",
+            "i don't know",
+            "i do not know",
         )
+
+        if title.lower().startswith(bad_starts):
+            logger.warning(
+                "Invalid AI title returned: %s",
+                title,
+            )
+            return _fallback_title(first_message)
 
         if title:
-            return title
-
-        logger.warning(
-            "Title generation returned empty content."
-        )
+            return title[:60]
 
     except Exception as e:
-
         logger.warning(
-            "Title generation failed: %s",
+            "Title generation failed, using fallback: %s",
             e,
         )
 
-    return _fallback_title(
-        first_message
-    )
+    return _fallback_title(first_message)
